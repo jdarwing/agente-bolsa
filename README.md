@@ -8,14 +8,14 @@ Paquete Python del agente. Cada carpeta/archivo corresponde a una capa del plan
 | Módulo | Capa | Estado |
 |---|---|---|
 | `agente/config.py` | Universo (lista blanca) y límites del IPS en código | ✅ Entregado |
-| `agente/risk.py` | **Capa de riesgo**: valida cada orden propuesta, frenos (breakers), kill switch | ✅ Entregado · 36 pruebas |
+| `agente/risk.py` | **Capa de riesgo**: valida cada orden propuesta, frenos (breakers), kill switch | ✅ Entregado · 38 pruebas |
 | `agente/audit.py` | Bitácora de auditoría (JSON Lines, solo-append) | ✅ Entregado |
 | `agente/strategy.py` | Señales (SMA200, EMA20/50, ATR, stops, cooldown de re-entrada) → propuestas de orden | ✅ Entregado · 23 pruebas |
-| `agente/broker.py` | Conexión a IB Gateway (paper 4002 / real bloqueado) + barras diarias vía IBKR | ✅ Entregado y probado contra IB Gateway real (18-sep-2026) |
+| `agente/broker.py` | Conexión a IB Gateway (paper 4002 / real bloqueado) + barras diarias (con volumen) vía IBKR | ✅ Entregado y probado contra IB Gateway real (18-sep-2026) |
 | `agente/test_connection.py` | Prueba de humo: conecta, lee cuenta y barras de SPY | ✅ Corrida con éxito en la Mac de Darwing |
-| `agente/runner.py` | Ciclo diario: leer precios → señales → riesgo → órdenes → bitácora → arbitraje de cupos → sleeve conservador (BIL) → estado persistido → stop-límite residente | ✅ Entregado y corrido contra IB Gateway real · 15 pruebas |
+| `agente/runner.py` | Ciclo diario: leer precios → señales → riesgo → órdenes → bitácora → arbitraje de cupos → sleeve conservador (BIL) → rebalanceo → estado persistido → stop-límite residente | ✅ Entregado y corrido contra IB Gateway real · 22 pruebas |
 | Respaldo de datos (Nasdaq.com CSV) | Se decidió NO hacer un `data.py` separado: `broker.daily_bars()` ya cubre la fuente principal (IBKR); el respaldo manual reutiliza `load_nasdaq_csv()` de `backtest/engine.py`, que ya existe | ✅ simplificado |
-| Control de versiones | Repositorio Git local creado en esta misma carpeta (18-sep-2026, primer commit `4ba17f7`) — falta conectarlo a GitHub, ver sección más abajo | 🔄 en curso |
+| Control de versiones | Git + GitHub (`github.com/jdarwing/agente-bolsa`, privado) — ver sección más abajo | ✅ Conectado (commit `81f58d5`) |
 
 ## Cómo correr las pruebas
 
@@ -48,10 +48,10 @@ python3 -m agente.runner --allow-partial-bar  # salta el guard de cierre de merc
 
 Mientras "Read-Only API" siga activo en IB Gateway, correr en modo lectura día tras día y
 revisar la bitácora es la forma de validar que las decisiones son las esperadas antes de
-arriesgar dinero de papel. Sus 15 pruebas (`tests/test_runner.py`) usan un bróker de mentira
+arriesgar dinero de papel. Sus 22 pruebas (`tests/test_runner.py`) usan un bróker de mentira
 (`FakeBroker`) — nunca IB Gateway real, que solo se puede probar desde esta Mac.
 
-**Tres brechas cerradas (evaluación de avance, 18-sep-2026):**
+**Siete brechas cerradas (evaluación de avance, 18-sep-2026):**
 
 1. **Sleeve conservador activo (IPS §5/§6/§8, reglas §7):** el efectivo que sobra al final de
    cada ciclo (por encima de `config.CASH_BUFFER`, US$100) se compra en `config.SLEEVE_TICKER`
@@ -65,6 +65,23 @@ arriesgar dinero de papel. Sus 15 pruebas (`tests/test_runner.py`) usan un brók
 3. **Guard de cierre de mercado:** `runner.py` ya no corre antes de las 4:15pm hora de Nueva
    York — antes de esa hora, la barra "de hoy" que reporta IBKR está a medio formar, y tratarla
    como el cierre real podría generar una señal sobre un precio que todavía se mueve.
+4. **`traded_today` se llena de verdad (`risk.py`):** `RiskEngine.evaluate()` ahora registra la
+   operación al aprobarla — la prohibición de ida-y-vuelta el mismo día (regla 10) ya se
+   verifica por código, no solo por diseño del flujo.
+5. **`--flow` para depósitos/retiros:** `python3 -m agente.runner --flow 5000` (depósito) o
+   `--flow -2000` (retiro) — ya hecho en IBKR el mismo día, antes de correr el ciclo — evita que
+   un movimiento de capital se vea como una ganancia o pérdida de mercado y dispare los frenos
+   sin motivo (IPS §7.1).
+6. **Rebalanceo por exceso de 10pp (IPS §8):** si la exposición a renta variable supera el tope
+   (50%) en más de `config.REBALANCE_TRIGGER_EXCESS_PCT` (10pp) por revalorización, se recorta
+   cada posición proporcionalmente hasta volver exactamente al tope.
+7. **Filtro de liquidez re-verificado en cada entrada (reglas §7):** antes de sumar un candidato
+   de entrada, se re-calcula su ADV en dólares de los últimos `config.LIQUIDITY_ADV_WINDOW_DAYS`
+   días (20); por debajo de `config.LIQUIDITY_ADV_MIN_USD` (US$10M), la entrada se omite con
+   aviso. **Pendiente de verificar contra datos reales:** la unidad en la que IBKR reporta
+   `volume` para estas barras (acciones individuales vs. lotes de 100) — confirmar en la primera
+   corrida real comparando el ADV calculado contra una referencia externa (Yahoo/IBKR TWS) antes
+   de confiar en un rechazo de este filtro.
 
 ## Automatizar la corrida diaria (LaunchAgent de macOS)
 
@@ -120,35 +137,36 @@ que despierte poco antes.
 
 ## Control de versiones (Git + GitHub)
 
-Hasta el 18-sep-2026 este código vivía solo en la carpeta de OneDrive, sin historial — cualquier
-reversión de sincronización (ver la nota operativa más abajo) podía perder un cambio sin dejar
-rastro de qué era la versión anterior. Se creó un repositorio Git **en esta misma carpeta**
-(`agente/.git/`), con un primer commit (`4ba17f7`) que incluye todo el código y las pruebas
-hasta esa fecha. Falta conectarlo a un repositorio remoto en GitHub — un solo paso, desde la
-Terminal de la Mac (esto sí requiere tu sesión de GitHub, no se puede hacer desde la nube):
+El código vive en un repositorio Git **en esta misma carpeta** (`agente/.git/`) y en un
+repositorio remoto privado en GitHub, `github.com/jdarwing/agente-bolsa` — conectado el
+18-sep-2026, vía HTTPS con tu sesión de GitHub en la Terminal de la Mac. Historial hasta ahora:
 
-1. En [github.com/new](https://github.com/new): nombre (ej. `agente-bolsa`), **Private**, sin
-   marcar "Add a README" ni "Add .gitignore" (el repositorio local ya existe con su propio
-   historial).
-2. En la Terminal:
+- `4ba17f7` — Fase 2: capa de riesgo, estrategia, broker, ciclo diario y pruebas (69→74).
+- `a73c468` — Documentar sleeve conservador, tope de dimensionamiento, guard de cierre de
+  mercado y control de versiones.
+- `81f58d5` — Cierra los 4 pendientes menores de la evaluación de avance: `traded_today`,
+  `--flow`, rebalanceo por exceso de 10pp, filtro de liquidez (69→83 pruebas en total).
+
+Cada vez que se entregue código nuevo a esta carpeta, hace falta un `git add -A && git commit -m "..."`
+(yo puedo hacerlo localmente desde la nube) seguido de un `git push` **desde tu propia Terminal**
+— el `push` necesita las credenciales de GitHub guardadas en tu Mac, que no están disponibles
+desde la sesión en la nube. Si alguna vez un commit mío queda sin subir, basta con:
 
 ```bash
 cd "/Users/darwingcasana/Library/CloudStorage/OneDrive-AGRICOLADONRICARDO/My Information/Agentes IA/Agente de Bolsa/agente"
-git log --oneline   # debería mostrar "4ba17f7 Fase 2: ..." — confirma que ves el mismo repositorio
-git remote add origin https://github.com/<tu-usuario>/agente-bolsa.git
-git push -u origin main
+git push origin main
 ```
 
-Con eso, cada vez que se entregue código nuevo a esta carpeta, un `git add -A && git commit -m "..." && git push`
-desde la Terminal (o pedírmelo a mí, yo puedo hacer `git add`/`commit` locales, pero el `push`
-final a GitHub necesita tu sesión) deja el cambio en GitHub con fecha e historial — y si algún
-día OneDrive revierte un archivo sin avisar, `git diff`/`git log` lo detecta de inmediato.
+Y si algún día OneDrive revierte un archivo sin avisar (ver la nota operativa más abajo),
+`git status`/`git diff`/`git log` lo detecta de inmediato — comparando contra el último commit,
+no contra la memoria de nadie.
 
 **Nota de riesgo:** el repositorio Git queda DENTRO de la carpeta sincronizada por OneDrive (a
 propósito, para no duplicar la carpeta) — y ya se vio, al crearlo, el mismo tipo de bloqueo de
-archivos ("Operation not permitted" en archivos temporales de Git) que afecta a los demás
-archivos de esta carpeta. No impidió el primer commit, pero si `git status`/`git log` alguna vez
-se ven raros, es la primera sospecha — igual que con cualquier otro archivo de esta carpeta.
+archivos ("Operation not permitted" en archivos temporales de Git, y una vez un `.git/HEAD.lock`
+trabado) que afecta a los demás archivos de esta carpeta. No ha impedido ningún commit hasta
+ahora, pero si `git status`/`git log` alguna vez se ven raros, es la primera sospecha — igual
+que con cualquier otro archivo de esta carpeta.
 
 ## Requisito de Python (Mac de Darwing)
 
@@ -192,13 +210,14 @@ operación por operación el backtest completo — eso solo se puede verificar u
 `runner.py`, y de todas formas la prueba real fuera de muestra es la Fase 4 (6 semanas de
 paper trading), no una réplica exacta del backtest.
 
-## Pendiente conocido: `traded_today` nunca se llena (encontrado 18-sep-2026)
+## Pendiente conocido: unidad de `volume` de IBKR sin verificar (18-sep-2026)
 
-`risk.PortfolioState.traded_today` existe y `RiskEngine.evaluate()` lo consulta (regla 10: no
-comprar y vender el mismo instrumento el mismo día), pero **ningún código lo llena todavía** —
-ni `runner.py` lo actualiza al aprobar/enviar una orden. En la práctica esto no puede pasar hoy
-(el ciclo corre una vez al día y una posición no puede tener a la vez una entrada y una salida
-pendientes), así que no es un riesgo activo, pero la regla no está realmente verificada por
-código, solo por diseño del flujo. Anotado para cerrarlo junto con el resto de reglas escritas
-y aún no implementadas (filtro de liquidez por entrada, rebalanceo por exceso de 10pp,
-`record_flow` para depósitos/retiros) — ver `evaluacion-avance-fase2.md` en el proyecto.
+Los cuatro pendientes menores de la evaluación de avance (`traded_today`, `--flow`, rebalanceo
+por exceso de 10pp, filtro de liquidez por entrada) ya están cerrados — ver la sección
+"Siete brechas cerradas" más arriba. Queda un único pendiente de esa misma ronda: `broker.py`
+pide la columna `volume` en las barras diarias para el filtro de liquidez, pero **todavía no se
+confirmó contra datos reales** en qué unidad la reporta IBKR para acciones/ETFs de EE.UU.
+(podría venir en acciones individuales o en lotes de 100). La primera corrida real con
+`runner.py` actualizado debe confirmar esto comparando el ADV en dólares que calcula contra una
+referencia externa (p.ej. Yahoo Finance o el propio IB TWS) antes de confiar en un rechazo del
+filtro de liquidez — ver `evaluacion-avance-fase2.md` en el proyecto.
