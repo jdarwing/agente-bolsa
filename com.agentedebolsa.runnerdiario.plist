@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentedebolsa.runnerdiario</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/darwingcasana/Library/CloudStorage/OneDrive-AGRICOLADONRICARDO/My Information/Agentes IA/Agente de Bolsa/agente/run_daily.sh</string>
+    </array>
+
+    <!-- Lunes a viernes, 6:00 pm hora de Perú (la hora del sistema de la Mac). -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer><key>Weekday</key><integer>1</integer></dict>
+        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer><key>Weekday</key><integer>2</integer></dict>
+        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer><key>Weekday</key><integer>3</integer></dict>
+        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer><key>Weekday</key><integer>4</integer></dict>
+        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer><key>Weekday</key><integer>5</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/darwingcasana/.agente_bolsa/runner_cron.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/darwingcasana/.agente_bolsa/runner_cron.err.log</string>
+
+    <!-- No corre al cargarlo, solo en el horario programado. -->
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

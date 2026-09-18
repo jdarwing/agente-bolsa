@@ -1,0 +1,4 @@
+pytest>=8
+ib_async>=2.0    # requiere Python >=3.10 (probado con 2.1.0 y Python 3.13.15)
+pandas>=2.0
+numpy>=1.26
