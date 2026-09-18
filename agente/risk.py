@@ -215,7 +215,14 @@ class RiskEngine:
             else:
                 ok("cash_ok")
 
-        return Decision(not reasons, tuple(reasons), tuple(checks))
+        approved = not reasons
+        if approved:
+            # Regla 4 (arriba) depende de que esto quede registrado — sin esto, `traded_today`
+            # nunca se llenaba y la prohibición de ida-y-vuelta el mismo día no se verificaba de
+            # verdad por código (pendiente encontrado en la evaluación de avance, 18-sep-2026).
+            # `roll_day()` lo limpia al empezar la sesión siguiente.
+            s.traded_today.setdefault(t, set()).add(p.side)
+        return Decision(approved, tuple(reasons), tuple(checks))
 
     # ------------------------------------------------------------------ frenos
     def update_marks(self, s: PortfolioState, equity_now: float, today: date) -> list[BreakerEvent]:

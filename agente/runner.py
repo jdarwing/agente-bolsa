@@ -58,6 +58,23 @@ Tres brechas cerradas tras la evaluación de avance (18-sep-2026, `evaluacion-av
    formar y tratarla como el cierre real generaría señales sobre un precio que todavía se mueve.
    `require_market_closed=False` (o `--allow-partial-bar` en la CLI) lo salta a propósito, para
    pruebas o si alguna vez hace falta mirar el estado sin esperar al cierre.
+
+Cuatro pendientes menores cerrados tras la misma evaluación (18-sep-2026):
+4. **`traded_today` ahora se llena de verdad** (`risk.RiskEngine.evaluate`): antes se leía pero
+   nunca se escribía, así que la prohibición de ida-y-vuelta el mismo día (regla 4) nunca se
+   verificaba por código.
+5. **`flow` registra depósitos/retiros** (ver el parámetro del mismo nombre abajo) para que no se
+   confundan con una ganancia o pérdida de mercado.
+6. **Rebalanceo por exceso de 10pp** (IPS §8, `_rebalance_if_needed`): recorta posiciones
+   proporcionalmente hasta el tope cuando la exposición lo supera en más de 10pp.
+7. **Filtro de liquidez re-verificado en cada entrada** (reglas §7, `_liquidity_check`): antes de
+   sumar un candidato de entrada, se re-calcula su ADV en dólares de los últimos
+   `config.LIQUIDITY_ADV_WINDOW_DAYS` días — si cae por debajo de `config.LIQUIDITY_ADV_MIN_USD`,
+   la entrada se omite (con aviso, nunca en silencio). Fail-open si no hay dato de volumen (no
+   bloquea por un hueco de datos, igual que el resto del código ante datos faltantes) — y OJO:
+   la unidad de `volume` que reporta IBKR para estas barras todavía no se verificó contra datos
+   reales (ver el docstring de `broker.py::daily_bars`), así que la primera corrida real debe
+   confirmarla antes de confiar en un rechazo de este filtro.
 """
 from __future__ import annotations
 
@@ -74,7 +91,9 @@ import pandas as pd
 from .audit import AuditLog
 from .broker import Broker
 from .config import (
-    AUDIT_LOG_PATH, CASH_BUFFER, EQUITY_TICKERS_ORDER, SIZING_EQUITY_CAP, SLEEVE_TICKER, STATE_PATH,
+    AUDIT_LOG_PATH, CASH_BUFFER, EQUITY_TICKERS_ORDER, LIQUIDITY_ADV_MIN_USD,
+    LIQUIDITY_ADV_WINDOW_DAYS, REBALANCE_TRIGGER_EXCESS_PCT, SIZING_EQUITY_CAP, SLEEVE_TICKER,
+    STATE_PATH,
 )
 from .risk import OrderProposal, PortfolioState, Position as RiskPosition, RiskEngine
 from .strategy import OpenPosition, Strategy, TickerMemory, indicators
@@ -179,14 +198,52 @@ def _is_trailing_stop(pos: OpenPosition, strat: Strategy) -> bool:
     return pos.stop > initial_stop + 1e-9
 
 
+def _liquidity_check(df: pd.DataFrame, min_adv_usd: float = LIQUIDITY_ADV_MIN_USD,
+                      window: int = LIQUIDITY_ADV_WINDOW_DAYS) -> tuple[bool, str | None]:
+    """Filtro de liquidez re-verificado en cada entrada (reglas §7, pendiente cerrado en la
+    evaluación de avance 18-sep-2026): ADV en dólares de los últimos `window` días de barras. Si
+    cae por debajo de `min_adv_usd`, la entrada no debe pasar.
+
+    Fail-open a propósito, igual que el resto del código ante un dato faltante (p.ej.
+    `_sleeve_close` devolviendo `None` sin bloquear el ciclo): si `df` no tiene columna `volume`
+    (bróker o barra sintética sin ese dato), o los últimos `window` días no traen ningún volumen
+    numérico utilizable, esta función deja pasar la entrada — nunca rechaza por no poder calcular,
+    solo por confirmar que el ADV de verdad está por debajo del mínimo. Ver `broker.py::daily_bars`
+    para la advertencia pendiente sobre la unidad de `volume` que reporta IBKR (sin verificar
+    todavía contra datos reales).
+
+    Devuelve `(pasa, detalle)` — `detalle` es `None` si pasó (con o sin poder calcularlo); si no
+    pasó, es el mensaje listo para el aviso/bitácora."""
+    if "volume" not in df.columns:
+        return True, None
+    recent = df.tail(window)
+    dollar_vol = (recent["volume"].astype(float) * recent["close"].astype(float)).dropna()
+    if dollar_vol.empty:
+        return True, None
+    adv = float(dollar_vol.mean())
+    if adv < min_adv_usd:
+        return False, (
+            f"ADV de los últimos {len(dollar_vol)} días: US${adv:,.0f}, por debajo del mínimo "
+            f"(US${min_adv_usd:,.0f}) — entrada omitida (reglas §7)."
+        )
+    return True, None
+
+
 # ---------------------------------------------------------------------------- ciclo diario
 def run_cycle(*, today: date | None = None, now: datetime | None = None, execute: bool = False,
-              require_market_closed: bool = True, broker: Broker | None = None,
+              require_market_closed: bool = True, flow: float = 0.0, broker: Broker | None = None,
               state_path: Path = STATE_PATH, audit_path: Path = AUDIT_LOG_PATH) -> dict:
     """Corre un ciclo diario completo y devuelve un resumen (dict) para imprimir/inspeccionar.
     `execute=False` por defecto: ver el modo de ejecución en el docstring del módulo.
     `require_market_closed=True` por defecto (brecha 3): exige que ya haya pasado el cierre de
-    NYSE/NASDAQ + margen antes de leer barras y calcular señales."""
+    NYSE/NASDAQ + margen antes de leer barras y calcular señales.
+    `flow` (pendiente cerrado en la evaluación de avance, 18-sep-2026): depósito (+) o retiro (-)
+    que YA se hizo en IBKR antes de correr este ciclo el mismo día. Sin esto, un depósito se vería
+    como una ganancia enorme (inflando el máximo histórico sin motivo) y un retiro como una
+    pérdida enorme (disparando el freno diario/semanal o el alto de portafolio sin motivo) — ver
+    `risk.record_flow()` y el IPS sección 7.1. Se aplica ANTES de `roll_day()` a propósito: así
+    la referencia del día ya incluye el flujo, y el retorno que calculan los frenos refleja solo
+    lo que hizo el mercado hoy, no el depósito/retiro."""
     today = today or date.today()
     if require_market_closed:
         _assert_market_closed(now or datetime.now(NY_TZ))
@@ -207,9 +264,9 @@ def run_cycle(*, today: date | None = None, now: datetime | None = None, execute
         broker.connect()
 
     report: dict[str, Any] = {
-        "date": today.isoformat(), "execute": execute,
+        "date": today.isoformat(), "execute": execute, "flow": 0.0,
         "breaker_events": [], "warnings": [], "exits": [], "entries": [], "rejected": [],
-        "resident_stops": [], "sleeve": [],
+        "resident_stops": [], "sleeve": [], "rebalance": [],
     }
 
     try:
@@ -230,6 +287,10 @@ def run_cycle(*, today: date | None = None, now: datetime | None = None, execute
             paused_until=date.fromisoformat(state.paused_until) if state.paused_until else None,
             killed=state.killed,
         )
+        if flow:
+            risk.record_flow(pf, flow)
+            audit.write("runner", "flow_registrado", monto=flow, equity_tras_flujo=pf.equity)
+            report["flow"] = flow
         risk.roll_day(pf, today)
         for ev in risk.update_marks(pf, broker_state.equity, today):
             audit.write("risk", ev.kind, detail=ev.detail, equity=ev.equity)
@@ -246,6 +307,8 @@ def run_cycle(*, today: date | None = None, now: datetime | None = None, execute
 
         # ---------------- 4. barras + indicadores por ticker (una sola vez por ciclo) ----------------
         rows: dict[str, pd.Series] = {}
+        dfs: dict[str, pd.DataFrame] = {}   # historial completo (no solo la última fila) — lo
+                                             # necesita `_liquidity_check` para el ADV de la ventana
         for t in EQUITY_TICKERS_ORDER:
             df = indicators(broker.daily_bars(t))
             if df.empty:
@@ -259,6 +322,7 @@ def run_cycle(*, today: date | None = None, now: datetime | None = None, execute
                     f"cierre oficial todavía no se publicó."
                 )
             rows[t] = last
+            dfs[t] = df
 
         # ---------------- 4b. precio del sleeve conservador (BIL) para barrido/desfondeo -------
         sleeve_close = _sleeve_close(broker)
@@ -272,9 +336,12 @@ def run_cycle(*, today: date | None = None, now: datetime | None = None, execute
 
         # ---------------- 6. entradas — con arbitraje de cupos por orden de lista ----------------
         _process_entries(broker, risk, strat, pf, open_positions, memory, state, rows, today, execute,
-                          audit, report, sleeve_close=sleeve_close)
+                          audit, report, sleeve_close=sleeve_close, dfs=dfs)
 
-        # ---------------- 6b. barrer el efectivo excedente al sleeve conservador ----------------
+        # ---------------- 6b. rebalanceo si la exposición quedó muy por encima del tope (IPS §8) ----
+        _rebalance_if_needed(broker, risk, pf, rows, today, execute, audit, report)
+
+        # ---------------- 6c. barrer el efectivo excedente al sleeve conservador ----------------
         _sweep_to_sleeve(broker, risk, pf, sleeve_close, today, execute, audit, report)
 
         # ---------------- 7. persistir estado ----------------
@@ -443,7 +510,8 @@ def _process_exits(broker: Broker, risk: RiskEngine, strat: Strategy, pf: Portfo
 def _process_entries(broker: Broker, risk: RiskEngine, strat: Strategy, pf: PortfolioState,
                       open_positions: dict[str, OpenPosition], memory: dict[str, TickerMemory],
                       state: AgentState, rows: dict[str, pd.Series], today: date, execute: bool,
-                      audit: AuditLog, report: dict, sleeve_close: float | None = None) -> None:
+                      audit: AuditLog, report: dict, sleeve_close: float | None = None,
+                      dfs: dict[str, pd.DataFrame] | None = None) -> None:
     if pf.halted or (pf.paused_until is not None and today < pf.paused_until):
         return  # los frenos ya lo bloquearían en risk.evaluate(), pero evita calcular en vano
 
@@ -454,14 +522,23 @@ def _process_entries(broker: Broker, risk: RiskEngine, strat: Strategy, pf: Port
         return
 
     # arbitraje de cupos: candidatos en el ORDEN de la lista, réplica del backtest aprobado —
-    # un rechazo de risk.py no le pasa su cupo al siguiente (ver docstring del módulo).
+    # un rechazo de risk.py no le pasa su cupo al siguiente (ver docstring del módulo). El filtro
+    # de liquidez (reglas §7, brecha 4) se aplica ANTES de sumar el candidato: un ticker ilíquido
+    # no debe quitarle un cupo a otro que sí pasaría (misma lógica que un rechazo de risk.py).
     candidates: list = []
     for t in EQUITY_TICKERS_ORDER:
         if t in busy or t not in rows:
             continue
         sig = strat.check_entry(t, rows[t], memory[t], today)
-        if sig is not None:
-            candidates.append(sig)
+        if sig is None:
+            continue
+        if dfs is not None and t in dfs:
+            liquid, detail = _liquidity_check(dfs[t])
+            if not liquid:
+                report["warnings"].append(f"{t}: {detail}")
+                audit.write("strategy", "liquidity_rejected", ticker=t, detail=detail)
+                continue
+        candidates.append(sig)
     candidates = candidates[:slots]
 
     # Sleeve conservador — "ventas primero" (brecha 1): si lo que se necesita hoy para las
@@ -501,6 +578,63 @@ def _process_entries(broker: Broker, risk: RiskEngine, strat: Strategy, pf: Port
         commission = max(risk.limits.comm_min, risk.limits.comm_per_share * proposal.qty)
         pf.cash -= proposal.qty * proposal.limit_price + commission
         pf.positions[sig.ticker] = RiskPosition(qty=proposal.qty, last_price=proposal.limit_price)
+
+
+# ---------------------------------------------------------------------------- rebalanceo (IPS §8)
+def _rebalance_if_needed(broker: Broker, risk: RiskEngine, pf: PortfolioState, rows: dict[str, pd.Series],
+                          today: date, execute: bool, audit: AuditLog, report: dict) -> None:
+    """IPS §8: "revisión trimestral, o antes si la exposición a renta variable supera el tope en
+    más de 10 puntos porcentuales por revalorización — en ese caso se recortan posiciones
+    proporcionalmente hasta volver al tope". Se corre después de las salidas/entradas normales de
+    hoy (así ve la exposición ya actualizada) y antes del barrido al sleeve. Vende una porción de
+    CADA posición de renta variable abierta, proporcional a su peso dentro de la exposición total
+    — nunca recorta por debajo del tope, solo hasta él. No es una señal de `strategy.py`: no
+    activa cooldown de re-entrada ni pasa por `state.pending_exits` (esto no es un stop ni un fin
+    de régimen), y no necesita reconciliación especial — `OpenPosition` no guarda cantidad propia,
+    así que la próxima corrida ve la cantidad ya reducida directo del bróker, como con cualquier
+    venta parcial real."""
+    L = risk.limits
+    if pf.equity <= 0:
+        return
+    exposure = pf.equity_exposure()
+    cap_amount = L.equity_cap_pct * pf.equity
+    trigger_amount = cap_amount + REBALANCE_TRIGGER_EXCESS_PCT * pf.equity
+    if exposure <= trigger_amount:
+        return
+    excess = exposure - cap_amount  # recortar EXACTAMENTE hasta el tope, no más abajo
+    held = [(t, p) for t, p in list(pf.positions.items()) if t in EQUITY_TICKERS_ORDER and p.qty > 0]
+    if not held:
+        return
+    for t, p in held:
+        row = rows.get(t)
+        if row is None:
+            continue
+        share = p.notional / exposure
+        sell_notional = excess * share
+        ref_close = float(row["close"])
+        limit_price = round(ref_close * (1 - L.limit_band), 4)
+        qty = min(p.qty, sell_notional / max(limit_price, 1e-9))
+        qty = round(qty, 6)
+        if qty <= 0 or qty * limit_price < L.min_order_notional:
+            continue
+        proposal = OrderProposal(ticker=t, side="SELL", qty=qty, limit_price=limit_price,
+                                  ref_close=ref_close, kind="LMT", reason="rebalance")
+        decision = risk.evaluate(proposal, pf, today)
+        audit.write("risk", "rebalance_decision", ticker=t, approved=decision.approved,
+                    reasons=decision.reasons, proposal=asdict(proposal))
+        report["rebalance"].append({"ticker": t, "qty": qty, "limit_price": limit_price,
+                                     "approved": decision.approved, "reasons": list(decision.reasons)})
+        if not decision.approved:
+            continue
+        if execute:
+            broker.submit_order(proposal)
+        commission = max(L.comm_min, L.comm_per_share * qty)
+        pf.cash += qty * limit_price - commission
+        remaining = p.qty - qty
+        if remaining > 1e-9:
+            pf.positions[t] = RiskPosition(qty=remaining, last_price=p.last_price)
+        else:
+            pf.positions.pop(t, None)
 
 
 # ---------------------------------------------------------------------------- sleeve conservador
@@ -594,6 +728,12 @@ def _print_report(report: dict) -> None:
     print(f"=== Ciclo {report['date']} ({'EJECUTANDO' if report['execute'] else 'solo lectura'}) ===")
     print(f"Equity: {report.get('equity', 0):.2f}  Cash: {report.get('cash', 0):.2f}  "
           f"Halted: {report.get('halted')}  Paused: {report.get('paused_until')}")
+    if report.get("flow"):
+        tipo = "DEPÓSITO" if report["flow"] > 0 else "RETIRO"
+        print(f"  [FLUJO] {tipo} registrado: {report['flow']:+.2f}")
+    for r in report.get("rebalance", []):
+        print(f"  REBALANCEO {r['ticker']:<5} qty={r['qty']:.4f} limite={r['limit_price']:.2f} "
+              f"{'ok' if r['approved'] else 'RECHAZADO: ' + ', '.join(r['reasons'])}")
     for ev in report["breaker_events"]:
         print(f"  [FRENO] {ev['kind']}: {ev['detail']}")
     for w in report["warnings"]:
@@ -624,11 +764,17 @@ def main() -> None:
                          help="Saltar el guard de cierre de mercado y correr aunque la barra de "
                               "hoy todavía esté a medio formar (NUNCA usar para decidir una orden "
                               "real — solo para revisar estado antes del cierre).")
+    parser.add_argument("--flow", type=float, default=0.0,
+                         help="Depósito (positivo) o retiro (negativo) que YA se hizo en IBKR "
+                              "hoy, antes de correr este ciclo — para que no se vea como una "
+                              "ganancia o pérdida de mercado. Ejemplo: --flow 5000 (depósito de "
+                              "US$5,000), --flow -2000 (retiro de US$2,000). Usar solo el día del "
+                              "movimiento, nunca en corridas posteriores del mismo flujo.")
     args = parser.parse_args()
 
     with Broker(live=False) as broker:
         report = run_cycle(execute=args.execute, require_market_closed=not args.allow_partial_bar,
-                            broker=broker)
+                            flow=args.flow, broker=broker)
     _print_report(report)
 
 

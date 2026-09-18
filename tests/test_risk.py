@@ -90,6 +90,27 @@ def test_no_comprar_y_vender_lo_mismo_el_mismo_dia():
     assert not ENG.evaluate(buy(), s2, TODAY)
 
 
+def test_evaluate_registra_traded_today_al_aprobar_y_bloquea_la_vuelta():
+    # Sin preset manual: la propia evaluate() debe dejar constancia de la compra aprobada, y esa
+    # constancia (no una que el test arme a mano) es la que bloquea la venta del mismo ticker el
+    # mismo día. Pendiente encontrado en la evaluación de avance (18-sep-2026).
+    s = state()
+    d1 = ENG.evaluate(buy(), s, TODAY)
+    assert d1.approved
+    assert s.traded_today == {"SPY": {"BUY"}}
+
+    s.positions["SPY"] = Position(1.0, 758.0)
+    d2 = ENG.evaluate(sell(), s, TODAY)
+    assert not d2 and any(r.startswith("SAME_DAY_ROUND_TRIP") for r in d2.reasons)
+
+
+def test_evaluate_no_registra_traded_today_si_la_orden_se_rechaza():
+    s = state(cash=10.0)  # efectivo insuficiente -> rechazada
+    d = ENG.evaluate(buy(), s, TODAY)
+    assert not d.approved
+    assert s.traded_today == {}
+
+
 # ---------------------------------------------------------------- órdenes límite
 def test_limite_de_compra_fuera_de_banda():
     d = ENG.evaluate(buy(px=758 * 1.006, ref=758), state(), TODAY)

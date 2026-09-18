@@ -104,12 +104,20 @@ class Broker:
 
     # ------------------------------------------------------------------ datos de precio
     def daily_bars(self, ticker: str, duration: str = "2 Y") -> pd.DataFrame:
-        """Barras diarias open/high/low/close, listas para `strategy.indicators()`. `duration`
-        en formato IBKR ("2 Y", "6 M", "30 D", …) — 2 años sobran para la SMA200 (~1 año de
-        historia) con margen."""
+        """Barras diarias open/high/low/close/volume, listas para `strategy.indicators()`.
+        `duration` en formato IBKR ("2 Y", "6 M", "30 D", …) — 2 años sobran para la SMA200 (~1
+        año de historia) con margen.
+
+        `volume` (evaluación de avance 18-sep-2026, filtro de liquidez re-verificado en cada
+        entrada, reglas §7): IBKR la trae en las barras de `whatToShow="TRADES"` sin pedirla
+        aparte. **Sin verificar todavía contra datos reales** en qué unidad llega para acciones/
+        ETFs de EE.UU. (podría venir en acciones individuales o en lotes de 100, según la versión
+        de la API) — la primera corrida real con `runner.py` actualizado debe confirmar esto
+        comparando el ADV en dólares que calcula contra un dato de referencia (p.ej. Yahoo/
+        IBKR TWS) antes de confiar en un rechazo del filtro de liquidez."""
         contract = Stock(ticker, "SMART", "USD")
         bars = self.ib.reqHistoricalData(contract, endDateTime="", durationStr=duration,
                                           barSizeSetting="1 day", whatToShow="TRADES", useRTH=True)
-        df = util.df(bars).set_index("date")[["open", "high", "low", "close"]]
+        df = util.df(bars).set_index("date")[["open", "high", "low", "close", "volume"]]
         df.index = pd.to_datetime(df.index)
         return df.astype(float)

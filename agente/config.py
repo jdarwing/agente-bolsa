@@ -42,6 +42,20 @@ SIZING_EQUITY_CAP: float | None = 10_000.0
 # dejar la cuenta en cero exacto por un redondeo. No es una regla del IPS, es un margen operativo.
 CASH_BUFFER: float = 100.0
 
+# Rebalanceo por exceso (IPS §8, pendiente cerrado en la evaluación de avance 18-sep-2026):
+# "revisión trimestral, o antes si la exposición a renta variable supera el tope en más de 10
+# puntos porcentuales por revalorización". `runner.py` recorta posiciones proporcionalmente
+# hasta volver AL TOPE (no más abajo) cuando la exposición supera `equity_cap_pct + este valor`.
+REBALANCE_TRIGGER_EXCESS_PCT: float = 0.10
+
+# Filtro de liquidez re-verificado en cada entrada (reglas §7, pendiente cerrado en la evaluación
+# de avance 18-sep-2026): ADV en dólares de los últimos `LIQUIDITY_ADV_WINDOW_DAYS` días, por
+# debajo de este mínimo, rechaza la entrada (con aviso, nunca en silencio). Referencia inicial
+# del plan de construcción: ADV >US$10M/día. Con estos 7 ETFs grandes, se espera que esto casi
+# nunca dispare — si lo hace, es una señal de que algo cambió y hay que revisarlo a mano.
+LIQUIDITY_ADV_MIN_USD: float = 10_000_000.0
+LIQUIDITY_ADV_WINDOW_DAYS: int = 20
+
 # --- Estado y bitácora del ciclo diario (runner.py) --------------------------
 # A propósito FUERA de la carpeta de OneDrive (`Agente de Bolsa/agente/`, ver README.md):
 # ese archivo cambia todos los días (a veces varias veces al día) y es el que más chocaría con

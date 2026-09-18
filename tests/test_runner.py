@@ -15,27 +15,39 @@ import pytest
 
 from agente.config import EQUITY_TICKERS_ORDER
 from agente.risk import Position
-from agente.runner import AgentState, _process_entries, _process_exits, _reconcile, run_cycle, save_state
+from agente.runner import (
+    AgentState, _liquidity_check, _process_entries, _process_exits, _reconcile, _rebalance_if_needed,
+    run_cycle, save_state,
+)
 from agente.strategy import OpenPosition, Strategy, TickerMemory
 
 TODAY = date(2024, 12, 17)   # coincide con el último día de las series sintéticas de abajo
 
 
 # ---------------------------------------------------------------------------- series sintéticas
-def _flat_bars(periods: int = 251, price: float = 100.0) -> pd.DataFrame:
+def _flat_bars(periods: int = 251, price: float = 100.0, volume: float | None = None) -> pd.DataFrame:
     """251 días hábiles planos: SMA200 válida, sin cruce (bull=False) -> nunca da señal de
-    entrada. Sirve de barra "sin novedad" para los tickers que no son el foco de una prueba."""
+    entrada. Sirve de barra "sin novedad" para los tickers que no son el foco de una prueba.
+    `volume` es opcional (columna omitida por defecto) — la mayoría de las pruebas no necesitan
+    liquidez, y `_liquidity_check` deja pasar cuando no hay columna `volume` (fail-open)."""
     idx = pd.date_range("2024-01-02", periods=periods, freq="B")
     close = np.full(periods, price)
-    return pd.DataFrame({"open": close, "high": close + 0.5, "low": close - 0.5, "close": close}, index=idx)
+    data = {"open": close, "high": close + 0.5, "low": close - 0.5, "close": close}
+    if volume is not None:
+        data["volume"] = np.full(periods, volume)
+    return pd.DataFrame(data, index=idx)
 
 
-def _entry_signal_bars() -> pd.DataFrame:
+def _entry_signal_bars(volume: float | None = None) -> pd.DataFrame:
     """Termina con bull_run==2 y cierre por encima de la SMA200 -> `check_entry` da señal en el
-    último día (2024-12-17), que es TODAY. Verificado a mano contra `strategy.indicators()`."""
+    último día (2024-12-17), que es TODAY. Verificado a mano contra `strategy.indicators()`.
+    `volume` opcional, para las pruebas del filtro de liquidez (reglas §7)."""
     idx = pd.date_range("2024-01-02", periods=251, freq="B")
     close = np.concatenate([np.full(248, 100.0), [100.0, 106.0, 108.0]])
-    return pd.DataFrame({"open": close, "high": close + 0.5, "low": close - 0.5, "close": close}, index=idx)
+    data = {"open": close, "high": close + 0.5, "low": close - 0.5, "close": close}
+    if volume is not None:
+        data["volume"] = np.full(251, volume)
+    return pd.DataFrame(data, index=idx)
 
 
 def _regime_exit_bars() -> pd.DataFrame:
@@ -162,6 +174,61 @@ def test_run_cycle_corre_despues_del_cierre_de_nyse(tmp_path):
     assert report["date"] == TODAY.isoformat()
 
 
+# ---------------------------------------------------------------------------- flujos (depósitos/retiros)
+def test_flow_evita_que_un_retiro_dispare_los_frenos_sin_motivo(tmp_path):
+    # Ayer cerró en 10,000. Hoy Darwing retira 3,000 (sin --flow esto se vería como -30%: dispara
+    # el freno diario Y el alto de portafolio). Con --flow -3000, el bróker reporta exactamente
+    # el retiro (7,000, sin ganancia/pérdida real de mercado) -> ningún freno debe dispararse.
+    state_path, audit_path = _paths(tmp_path)
+    prev = AgentState(last_equity=10_000.0, high_water_mark=10_000.0,
+                       day_start_equity=10_000.0, week_start_equity=10_000.0)
+    save_state(prev, state_path)
+    broker = FakeBroker(equity=7_000.0, cash=7_000.0)
+    report = run_cycle(today=TODAY, execute=False, require_market_closed=False, flow=-3_000.0,
+                        broker=broker, state_path=state_path, audit_path=audit_path)
+    assert report["breaker_events"] == []
+    assert report["flow"] == -3_000.0
+    assert report["equity"] == pytest.approx(7_000.0)
+
+
+# ---------------------------------------------------------------------------- rebalanceo (IPS §8)
+def test_rebalance_recorta_proporcionalmente_hasta_el_tope_cuando_supera_60pct():
+    from agente.audit import AuditLog
+    from agente.risk import PortfolioState, RiskEngine
+    from agente.strategy import indicators as _ind
+
+    # Exposición actual: 7,000 de 10,000 (70%) — supera el tope (50%) + 10pp (60%) por 10pp reales.
+    row = _ind(_flat_bars(price=700.0)).iloc[-1]
+    pf = PortfolioState(equity=10_000.0, cash=1_000.0, positions={"SPY": Position(qty=10.0, last_price=700.0)})
+    risk = RiskEngine()
+    report = {"rebalance": []}
+    audit = AuditLog(_tmp_audit_path())
+
+    _rebalance_if_needed(None, risk, pf, {"SPY": row}, TODAY, False, audit, report)
+
+    assert report["rebalance"] and report["rebalance"][0]["approved"]
+    nueva_exposicion = pf.positions["SPY"].qty * pf.positions["SPY"].last_price
+    assert nueva_exposicion <= 5_000.0 + 1.0   # de vuelta cerca del tope (50% de 10,000), no por debajo
+
+
+def test_rebalance_no_hace_nada_si_la_exposicion_no_supera_el_tope_mas_10pp():
+    from agente.audit import AuditLog
+    from agente.risk import PortfolioState, RiskEngine
+    from agente.strategy import indicators as _ind
+
+    # 55% de exposición: supera el tope (50%) pero NO el margen de 10pp (60%) -> no recorta.
+    row = _ind(_flat_bars(price=550.0)).iloc[-1]
+    pf = PortfolioState(equity=10_000.0, cash=4_500.0, positions={"SPY": Position(qty=10.0, last_price=550.0)})
+    risk = RiskEngine()
+    report = {"rebalance": []}
+    audit = AuditLog(_tmp_audit_path())
+
+    _rebalance_if_needed(None, risk, pf, {"SPY": row}, TODAY, False, audit, report)
+
+    assert report["rebalance"] == []
+    assert pf.positions["SPY"].qty == pytest.approx(10.0)
+
+
 # ---------------------------------------------------------------------------- sleeve conservador (BIL)
 def test_sweep_barre_el_efectivo_excedente_a_bil(tmp_path):
     # Sin señales de entrada/salida hoy y mucho efectivo libre -> al final del ciclo se compra
@@ -191,6 +258,41 @@ def test_defund_vende_bil_para_financiar_una_entrada_sin_efectivo_libre(tmp_path
     defunds = [s for s in report["sleeve"] if s["action"] == "defund"]
     assert defunds and defunds[0]["approved"] and defunds[0]["qty"] > 0
     assert any(e["ticker"] == "SPY" and e["approved"] for e in report["entries"])
+
+
+# ---------------------------------------------------------------------------- liquidez (reglas §7)
+def test_liquidity_check_pasa_si_no_hay_columna_volume():
+    # Fail-open a propósito (docstring de `_liquidity_check`): sin dato de volumen, nunca bloquea.
+    df = _flat_bars()
+    assert _liquidity_check(df) == (True, None)
+
+
+def test_liquidity_check_pasa_con_adv_alto_y_bloquea_con_adv_bajo():
+    alto = _flat_bars(price=100.0, volume=500_000.0)   # ADV ≈ US$50M > mínimo (US$10M)
+    bajo = _flat_bars(price=100.0, volume=1_000.0)      # ADV ≈ US$100K < mínimo
+
+    pasa, detalle = _liquidity_check(alto)
+    assert pasa and detalle is None
+
+    pasa, detalle = _liquidity_check(bajo)
+    assert not pasa and "ADV" in detalle and "US$" in detalle
+
+
+def test_run_cycle_permite_la_entrada_con_liquidez_alta(tmp_path):
+    state_path, audit_path = _paths(tmp_path)
+    broker = FakeBroker(bars={"SPY": _entry_signal_bars(volume=500_000.0)})
+    report = run_cycle(today=TODAY, execute=False, require_market_closed=False, broker=broker,
+                        state_path=state_path, audit_path=audit_path)
+    assert any(e["ticker"] == "SPY" and e["approved"] for e in report["entries"])
+
+
+def test_run_cycle_omite_la_entrada_con_liquidez_baja_y_avisa(tmp_path):
+    state_path, audit_path = _paths(tmp_path)
+    broker = FakeBroker(bars={"SPY": _entry_signal_bars(volume=1_000.0)})
+    report = run_cycle(today=TODAY, execute=False, require_market_closed=False, broker=broker,
+                        state_path=state_path, audit_path=audit_path)
+    assert not any(e["ticker"] == "SPY" for e in report["entries"])
+    assert any("SPY" in w and "ADV" in w for w in report["warnings"])
 
 
 # ---------------------------------------------------------------------------- tope de dimensionamiento
