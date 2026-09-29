@@ -16,7 +16,7 @@ en un archivo de entorno separado — el valor por defecto del código es `False
 from __future__ import annotations
 
 import pandas as pd
-from ib_async import IB, LimitOrder, Stock, StopLimitOrder, Trade, util
+from ib_async import IB, LimitOrder, StartupFetch, Stock, StopLimitOrder, Trade, util
 
 from .config import BROKER
 from .risk import OrderProposal, Position, PortfolioState
@@ -35,16 +35,40 @@ class Broker:
         self.ib = IB()
 
     def connect(self) -> None:
-        """`timeout=20` explícito (evaluación de avance, 28-sep-2026): con el valor por defecto
-        de `ib_async` (~4s), la sincronización inicial de órdenes abiertas/completadas no
-        siempre alcanzaba a completarse contra IB Gateway antes de que se agotara el tiempo —
-        de ahí los avisos "open orders request timed out" / "completed orders request timed
-        out" que aparecían en cada corrida (no son un error fatal, la conexión igual se
-        establece). Importa porque una sincronización a medias deja `self.ib.trades()`
-        incompleto, y `cancel_order()` busca ahí la orden del stop residente anterior antes de
-        reemplazarla — ver su docstring. Sin verificar todavía si 20s alcanza siempre contra el
-        IB Gateway real de Darwing; si el aviso reaparece, subir este número."""
-        self.ib.connect(BROKER.host, self.port, clientId=BROKER.client_id, timeout=20)
+        """No pide la sincronización inicial de órdenes abiertas/completadas al conectar
+        (evaluación de avance, 29-sep-2026 — corrige el diagnóstico del 28-sep, ver abajo).
+
+        El 28-sep se subió `timeout` a 20s (antes ~4s, el default de `ib_async`) para los avisos
+        "open orders request timed out" / "completed orders request timed out" que aparecían en
+        cada corrida, asumiendo que 4s era poco tiempo. **La corrida real del 29-sep confirmó que
+        esa no era la causa**: el aviso siguió apareciendo igual con 20s. Revisando el código
+        fuente de `ib_async` (`ib.py`, `connectAsync()`): al conectar, la librería pide en
+        paralelo posiciones, órdenes abiertas y órdenes completadas, y cada una tiene el mismo
+        `timeout` — si "open orders"/"completed orders" nunca completan ni en 4s ni en 20s, el
+        problema no es la duración, sino que esas dos solicitudes concretas no reciben el mensaje
+        de cierre de IB Gateway (posible relación con "Read-Only API" activo — no se pudo
+        confirmar la causa exacta desde la sesión en la nube, solo el punto donde ocurre).
+
+        La solución real: no pedirlas al conectar, porque este código no las necesita ahí.
+        `runner.py` nunca llama a `self.ib.trades()` — el único lugar que lo hace es
+        `cancel_order()`, que ya pide su propia resincronización justo antes de usarla (ver su
+        docstring), no depende de lo que se haya sincronizado al conectar. `fetchFields` deja
+        fuera `ORDERS_OPEN`/`ORDERS_COMPLETE` a propósito; posiciones, cuenta y ejecuciones se
+        siguen pidiendo igual, con `timeout=20` de margen para esas (se deja, aunque ya no aplique
+        al aviso original, por si alguna tarda).
+
+        **Sin verificar todavía contra IB Gateway real**: esto se confirmó leyendo el código de
+        `ib_async`, no corriendo contra el Gateway de Darwing — hay que confirmarlo en la próxima
+        corrida (el aviso debería desaparecer del todo; si no, la causa es otra)."""
+        self.ib.connect(
+            BROKER.host, self.port, clientId=BROKER.client_id, timeout=20,
+            fetchFields=(
+                StartupFetch.POSITIONS
+                | StartupFetch.ACCOUNT_UPDATES
+                | StartupFetch.SUB_ACCOUNT_UPDATES
+                | StartupFetch.EXECUTIONS
+            ),
+        )
 
     def disconnect(self) -> None:
         if self.ib.isConnected():
