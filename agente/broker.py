@@ -35,7 +35,16 @@ class Broker:
         self.ib = IB()
 
     def connect(self) -> None:
-        self.ib.connect(BROKER.host, self.port, clientId=BROKER.client_id)
+        """`timeout=20` explícito (evaluación de avance, 28-sep-2026): con el valor por defecto
+        de `ib_async` (~4s), la sincronización inicial de órdenes abiertas/completadas no
+        siempre alcanzaba a completarse contra IB Gateway antes de que se agotara el tiempo —
+        de ahí los avisos "open orders request timed out" / "completed orders request timed
+        out" que aparecían en cada corrida (no son un error fatal, la conexión igual se
+        establece). Importa porque una sincronización a medias deja `self.ib.trades()`
+        incompleto, y `cancel_order()` busca ahí la orden del stop residente anterior antes de
+        reemplazarla — ver su docstring. Sin verificar todavía si 20s alcanza siempre contra el
+        IB Gateway real de Darwing; si el aviso reaparece, subir este número."""
+        self.ib.connect(BROKER.host, self.port, clientId=BROKER.client_id, timeout=20)
 
     def disconnect(self) -> None:
         if self.ib.isConnected():
@@ -96,7 +105,17 @@ class Broker:
     def cancel_order(self, order_id: int) -> None:
         """Cancela una orden viva por `orderId` (p.ej. el stop residente anterior, antes de
         reemplazarlo por uno con el stop ya subido). No hace nada si ya no está viva — cancelar
-        dos veces la misma orden, o una que ya se llenó, no es un error aquí."""
+        dos veces la misma orden, o una que ya se llenó, no es un error aquí.
+
+        Pide una sincronización fresca de órdenes abiertas antes de buscar (evaluación de avance,
+        28-sep-2026): `self.ib.trades()` se llena en gran parte al conectar (ver `connect()`), y
+        si esa sincronización inicial no alcanzó a completarse a tiempo, esta orden podría no
+        aparecer todavía — sin este refresco, la cancelación fallaría en silencio y `runner.py`
+        terminaría con dos órdenes de stop vivas para el mismo ticker. Sin verificar todavía
+        contra una corrida real con un stop residente vigente — confirmar la primera vez que se
+        tenga que reemplazar uno de verdad."""
+        self.ib.reqAllOpenOrders()
+        self.ib.sleep(1)
         for trade in self.ib.trades():
             if trade.order.orderId == order_id and not trade.isDone():
                 self.ib.cancelOrder(trade.order)

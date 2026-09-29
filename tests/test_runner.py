@@ -13,11 +13,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from agente.config import EQUITY_TICKERS_ORDER
+from agente.config import CASH_BUFFER, EQUITY_TICKERS_ORDER, LIMITS
 from agente.risk import Position
 from agente.runner import (
-    AgentState, _liquidity_check, _process_entries, _process_exits, _reconcile, _rebalance_if_needed,
-    run_cycle, save_state,
+    AgentState, _affordable_qty, _liquidity_check, _process_entries, _process_exits, _reconcile,
+    _rebalance_if_needed, _sell_qty_for_proceeds, run_cycle, save_state,
 )
 from agente.strategy import OpenPosition, Strategy, TickerMemory
 
@@ -258,6 +258,50 @@ def test_defund_vende_bil_para_financiar_una_entrada_sin_efectivo_libre(tmp_path
     defunds = [s for s in report["sleeve"] if s["action"] == "defund"]
     assert defunds and defunds[0]["approved"] and defunds[0]["qty"] > 0
     assert any(e["ticker"] == "SPY" and e["approved"] for e in report["entries"])
+
+
+# ------------------------------------------------------ cálculo del buffer (bug cerrado 28-sep-2026)
+def test_affordable_qty_respeta_el_efectivo_con_comision_por_accion_en_ordenes_grandes():
+    # Con una orden grande, la comisión real es por acción (comm_per_share) y supera el mínimo
+    # asumido (comm_min) — antes del fix, _sweep_to_sleeve restaba siempre comm_min y terminaba
+    # gastando más de lo disponible en la práctica. El costo total (qty*precio + comisión real)
+    # nunca debe superar lo disponible.
+    available, limit_price = 999_899.96, 92.0881
+    qty = _affordable_qty(available, limit_price, LIMITS)
+    commission = max(LIMITS.comm_min, LIMITS.comm_per_share * qty)
+    assert qty * limit_price + commission == pytest.approx(available, abs=0.01)
+
+
+def test_affordable_qty_usa_el_piso_de_comision_en_ordenes_chicas():
+    # Con una orden chica, la comisión por acción no alcanza el mínimo -> se usa comm_min.
+    available, limit_price = 50.0, 91.0
+    qty = _affordable_qty(available, limit_price, LIMITS)
+    assert LIMITS.comm_per_share * qty < LIMITS.comm_min   # confirma que cae en esta rama
+    commission = max(LIMITS.comm_min, LIMITS.comm_per_share * qty)
+    assert qty * limit_price + commission == pytest.approx(available, abs=0.01)
+
+
+def test_sell_qty_for_proceeds_alcanza_lo_necesario_con_comision_por_accion():
+    needed, limit_price = 50_000.0, 91.0
+    qty = _sell_qty_for_proceeds(needed, limit_price, LIMITS)
+    commission = max(LIMITS.comm_min, LIMITS.comm_per_share * qty)
+    proceeds = qty * limit_price - commission
+    assert proceeds == pytest.approx(needed, abs=0.01)
+
+
+def test_sweep_respeta_el_buffer_exacto_con_comision_por_accion_en_cuenta_grande(tmp_path):
+    # Reproduce el bug real (evaluación de avance 28-sep-2026): con la cuenta paper de
+    # US$1,000,000, la comisión real del barrido es por acción (~US$38), no el mínimo
+    # (US$0.35) que asumía la fórmula vieja -- esa dejaba solo ~US$62 de reserva en vez de
+    # los US$100 de CASH_BUFFER. Con el fix, el efectivo que queda debe ser CASH_BUFFER, no
+    # menos (y sin pasarse tampoco).
+    state_path, audit_path = _paths(tmp_path)
+    broker = FakeBroker(equity=1_000_000.0, cash=1_000_000.0, bars={"BIL": _flat_bars(price=91.63)})
+    report = run_cycle(today=TODAY, execute=False, require_market_closed=False, broker=broker,
+                        state_path=state_path, audit_path=audit_path)
+    sweeps = [s for s in report["sleeve"] if s["action"] == "sweep"]
+    assert sweeps and sweeps[0]["approved"]
+    assert report["cash"] == pytest.approx(CASH_BUFFER, abs=0.01)
 
 
 # ---------------------------------------------------------------------------- liquidez (reglas §7)

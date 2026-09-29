@@ -75,6 +75,15 @@ Cuatro pendientes menores cerrados tras la misma evaluación (18-sep-2026):
    la unidad de `volume` que reporta IBKR para estas barras todavía no se verificó contra datos
    reales (ver el docstring de `broker.py::daily_bars`), así que la primera corrida real debe
    confirmarla antes de confiar en un rechazo de este filtro.
+
+Corrección al cálculo del buffer del sleeve (evaluación de avance, 28-sep-2026): `_sweep_to_sleeve`
+y `_defund_sleeve` asumían siempre `comm_min` como la comisión al calcular cuánto comprar/vender,
+pero la comisión real de IBKR es por acción (`comm_per_share`) y en órdenes grandes supera por
+mucho ese mínimo — el barrido dejaba menos de `config.CASH_BUFFER` de reserva de lo pactado
+(~US$62 en vez de US$100, visto en la corrida del 28-sep-2026 con la cuenta paper de
+US$1,000,000). `_affordable_qty`/`_sell_qty_for_proceeds` corrigen esto contando la comisión real.
+Nunca fue peligroso (el efectivo nunca quedó en negativo), pero sí una reserva más chica de lo
+pactado.
 """
 from __future__ import annotations
 
@@ -92,8 +101,8 @@ from .audit import AuditLog
 from .broker import Broker
 from .config import (
     AUDIT_LOG_PATH, CASH_BUFFER, EQUITY_TICKERS_ORDER, LIQUIDITY_ADV_MIN_USD,
-    LIQUIDITY_ADV_WINDOW_DAYS, REBALANCE_TRIGGER_EXCESS_PCT, SIZING_EQUITY_CAP, SLEEVE_TICKER,
-    STATE_PATH,
+    LIQUIDITY_ADV_WINDOW_DAYS, REBALANCE_TRIGGER_EXCESS_PCT, RiskLimits, SIZING_EQUITY_CAP,
+    SLEEVE_TICKER, STATE_PATH,
 )
 from .risk import OrderProposal, PortfolioState, Position as RiskPosition, RiskEngine
 from .strategy import OpenPosition, Strategy, TickerMemory, indicators
@@ -651,6 +660,48 @@ def _sleeve_close(broker: Broker) -> float | None:
     return float(df.iloc[-1]["close"])
 
 
+def _affordable_qty(cash_available: float, limit_price: float, L: RiskLimits) -> float:
+    """Cuántas unidades a `limit_price` se pueden comprar sin exceder `cash_available`, contando
+    la comisión REAL de IBKR — por acción (`comm_per_share`), con un piso de `comm_min` — en vez
+    de asumir siempre el piso.
+
+    Bug cerrado (evaluación de avance, 28-sep-2026): `_sweep_to_sleeve` calculaba `qty` restando
+    siempre `comm_min` (US$0.35) de `cash_available`, como si esa fuera la comisión real. Eso es
+    cierto solo para órdenes chicas (`qty * comm_per_share < comm_min`, con los parámetros
+    actuales, menos de ~100 acciones) — con una orden grande (como el barrido en la cuenta paper
+    de US$1,000,000, ~10,858 acciones) la comisión real es por acción y supera por mucho el
+    mínimo asumido, así que la compra terminaba costando más de lo calculado y el barrido dejaba
+    menos de `config.CASH_BUFFER` de reserva de lo que la regla pretende (~US$62 en vez de
+    US$100 en la corrida del 28-sep-2026) — nunca negativo, pero menos margen del pactado.
+
+    Con la comisión por acción ya sumada al precio, el costo total es `qty * (limit_price +
+    comm_per_share)` — de ahí la primera rama. Solo cuando esa `qty` es tan chica que la
+    comisión por acción no alcanza el piso, se usa la otra fórmula (con `comm_min` fijo)."""
+    if cash_available <= 0:
+        return 0.0
+    qty_per_share = cash_available / (limit_price + L.comm_per_share)
+    if qty_per_share * L.comm_per_share >= L.comm_min:
+        return qty_per_share
+    return max(0.0, (cash_available - L.comm_min) / limit_price)
+
+
+def _sell_qty_for_proceeds(needed: float, limit_price: float, L: RiskLimits) -> float:
+    """Cuántas unidades vender a `limit_price` para que el efectivo NETO (ya descontada la
+    comisión real) alcance al menos `needed` — misma corrección que `_affordable_qty` (ver su
+    docstring), aplicada del lado de la venta: cada acción aporta `limit_price - comm_per_share`
+    neto una vez que la comisión por acción supera el piso `comm_min`. `_defund_sleeve` ya usaba
+    una fórmula con `comm_min` fijo — nunca vendía de más (no era peligroso, el peor caso era
+    quedarse corta y que `risk.py` rechazara la entrada por INSUFFICIENT_CASH), pero subestimaba
+    la comisión real en órdenes grandes igual que `_sweep_to_sleeve`; se corrige aquí por
+    consistencia."""
+    if needed <= 0:
+        return 0.0
+    net_per_share = limit_price - L.comm_per_share
+    if net_per_share > 0 and (needed / net_per_share) * L.comm_per_share >= L.comm_min:
+        return needed / net_per_share
+    return (needed + L.comm_min) / limit_price
+
+
 def _defund_sleeve(needed: float, broker: Broker, risk: RiskEngine, pf: PortfolioState,
                     sleeve_close: float, today: date, execute: bool, audit: AuditLog, report: dict) -> None:
     """Vende parte (o todo) del sleeve conservador para financiar entradas de renta variable
@@ -665,7 +716,7 @@ def _defund_sleeve(needed: float, broker: Broker, risk: RiskEngine, pf: Portfoli
     if needed <= 0 or held <= 0:
         return
     limit_price = round(sleeve_close * (1 - L.limit_band), 4)
-    qty = min(held, (needed + L.comm_min) / max(limit_price, 1e-9))
+    qty = min(held, _sell_qty_for_proceeds(needed, max(limit_price, 1e-9), L))
     qty = round(qty, 6)
     if qty <= 0:
         return
@@ -695,7 +746,11 @@ def _sweep_to_sleeve(broker: Broker, risk: RiskEngine, pf: PortfolioState, sleev
     efectivo ocioso (IBKR no paga interés sobre los primeros US$10,000, checklist de apertura).
     Se corre al final del ciclo, después de que las entradas de hoy ya comprometieron lo suyo. Si
     los frenos bloquean compras (halted/paused), `risk.evaluate()` rechaza esta compra igual que
-    cualquier otra — el efectivo queda sin invertir ese día, sin ningún riesgo adicional."""
+    cualquier otra — el efectivo queda sin invertir ese día, sin ningún riesgo adicional.
+
+    El tamaño se calcula con `_affordable_qty` (contando la comisión real por acción, no un
+    mínimo asumido — ver su docstring) para que `config.CASH_BUFFER` quede respetado de verdad,
+    no solo aproximadamente."""
     if sleeve_close is None:
         return
     L = risk.limits
@@ -703,7 +758,7 @@ def _sweep_to_sleeve(broker: Broker, risk: RiskEngine, pf: PortfolioState, sleev
     if available < L.min_order_notional:
         return
     limit_price = round(sleeve_close * (1 + L.limit_band), 4)
-    qty = round((available - L.comm_min) / max(limit_price, 1e-9), 6)
+    qty = round(_affordable_qty(available, max(limit_price, 1e-9), L), 6)
     if qty <= 0:
         return
     proposal = OrderProposal(ticker=SLEEVE_TICKER, side="BUY", qty=qty, limit_price=limit_price,
