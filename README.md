@@ -11,11 +11,11 @@ Paquete Python del agente. Cada carpeta/archivo corresponde a una capa del plan
 | `agente/risk.py` | **Capa de riesgo**: valida cada orden propuesta, frenos (breakers), kill switch | ✅ Entregado · 38 pruebas |
 | `agente/audit.py` | Bitácora de auditoría (JSON Lines, solo-append) | ✅ Entregado |
 | `agente/strategy.py` | Señales (SMA200, EMA20/50, ATR, stops, cooldown de re-entrada) → propuestas de orden | ✅ Entregado · 23 pruebas |
-| `agente/broker.py` | Conexión a IB Gateway (paper 4002 / real bloqueado) + barras diarias (con volumen) vía IBKR | ✅ Entregado y probado contra IB Gateway real (18-sep-2026) |
+| `agente/broker.py` | Conexión a IB Gateway (paper 4002 / real bloqueado) + barras diarias (con volumen) vía IBKR | ✅ Entregado y probado contra IB Gateway real (18-sep-2026) · timeout de conexión (20s) y resync de `cancel_order()` endurecidos (29-sep-2026) |
 | `agente/test_connection.py` | Prueba de humo: conecta, lee cuenta y barras de SPY | ✅ Corrida con éxito en la Mac de Darwing |
-| `agente/runner.py` | Ciclo diario: leer precios → señales → riesgo → órdenes → bitácora → arbitraje de cupos → sleeve conservador (BIL) → rebalanceo → estado persistido → stop-límite residente | ✅ Entregado y corrido contra IB Gateway real · 22 pruebas |
+| `agente/runner.py` | Ciclo diario: leer precios → señales → riesgo → órdenes → bitácora → arbitraje de cupos → sleeve conservador (BIL) → rebalanceo → estado persistido → stop-límite residente | ✅ Entregado y corrido contra IB Gateway real · 26 pruebas (cálculo del buffer del sleeve corregido, 29-sep-2026) |
 | Respaldo de datos (Nasdaq.com CSV) | Se decidió NO hacer un `data.py` separado: `broker.daily_bars()` ya cubre la fuente principal (IBKR); el respaldo manual reutiliza `load_nasdaq_csv()` de `backtest/engine.py`, que ya existe | ✅ simplificado |
-| Control de versiones | Git + GitHub (`github.com/jdarwing/agente-bolsa`, privado) — ver sección más abajo | ✅ Conectado (commit `81f58d5`) |
+| Control de versiones | Git + GitHub (`github.com/jdarwing/agente-bolsa`, privado) — ver sección más abajo | ✅ Conectado (commit `ce7a4c0`) |
 
 ## Cómo correr las pruebas
 
@@ -48,7 +48,7 @@ python3 -m agente.runner --allow-partial-bar  # salta el guard de cierre de merc
 
 Mientras "Read-Only API" siga activo en IB Gateway, correr en modo lectura día tras día y
 revisar la bitácora es la forma de validar que las decisiones son las esperadas antes de
-arriesgar dinero de papel. Sus 22 pruebas (`tests/test_runner.py`) usan un bróker de mentira
+arriesgar dinero de papel. Sus pruebas (`tests/test_runner.py`) usan un bróker de mentira
 (`FakeBroker`) — nunca IB Gateway real, que solo se puede probar desde esta Mac.
 
 **Siete brechas cerradas (evaluación de avance, 18-sep-2026):**
@@ -83,7 +83,30 @@ arriesgar dinero de papel. Sus 22 pruebas (`tests/test_runner.py`) usan un brók
    corrida real comparando el ADV calculado contra una referencia externa (Yahoo/IBKR TWS) antes
    de confiar en un rechazo de este filtro.
 
+**Octava brecha cerrada (29-sep-2026), al revisar las corridas del 24 y 28-sep:** el cash
+post-barrido quedaba consistentemente en ~US$62 en vez de la reserva de US$100
+(`config.CASH_BUFFER`) — no era ruido, era un bug real. `_sweep_to_sleeve()`/`_defund_sleeve()`
+calculaban cuánto BIL comprar/vender asumiendo que la comisión de IBKR siempre era la mínima
+(US$0.35), cuando en realidad es `max(US$0.35, US$0.0035 × cantidad de acciones)` — en una
+compra de ~10,858 acciones eso son más de US$38 reales, no US$0.35, y ese exceso salía de la
+reserva. Se agregaron `_affordable_qty()` y `_sell_qty_for_proceeds()`, que resuelven la
+cantidad correcta considerando la comisión por acción. De paso se revisaron los avisos
+recurrentes de timeout ("open orders request timed out" / "completed orders request timed
+out"): el timeout de conexión por defecto de `ib_async` (~4s) probablemente no alcanzaba para
+que la sincronización inicial de órdenes terminara — se subió a 20s en `broker.connect()`, y
+`cancel_order()` ahora resincroniza órdenes abiertas antes de buscar la que va a cancelar. 4
+pruebas nuevas (83→87 en total). **Pendiente de verificar contra IB Gateway real:** que el cash
+post-barrido quede ahora cerca de los US$100, que el aviso de timeout no reaparezca, y que
+`cancel_order()` funcione la primera vez que haya que reemplazar un stop vigente de verdad.
+
 ## Automatizar la corrida diaria (LaunchAgent de macOS)
+
+**Nota (29-sep-2026): este LaunchAgent NO se instaló para uso diario** (ver "Cadencia del ciclo
+diario" en `plan-construccion-agente-bolsa.md` — se optó por el recordatorio manual de Claude).
+Un LaunchAgent de un intento anterior (`com.agentedebolsa.runnerdiario`) sí quedó instalado y
+activo por error, fallando en silencio (`exit code 127`) desde hace tiempo — Darwing lo detectó
+y lo desactivó el 28-sep-2026 (`launchctl unload` + borrado del `.plist`). Los archivos de esta
+sección siguen aquí de reserva para la Fase 4 (VPS + IBC), no para uso inmediato.
 
 Para no depender de acordarse de abrir la Terminal cada día, `run_daily.sh` +
 `com.agentedebolsa.runnerdiario.plist` (en esta misma carpeta) programan el ciclo con
@@ -146,6 +169,9 @@ repositorio remoto privado en GitHub, `github.com/jdarwing/agente-bolsa` — con
   mercado y control de versiones.
 - `81f58d5` — Cierra los 4 pendientes menores de la evaluación de avance: `traded_today`,
   `--flow`, rebalanceo por exceso de 10pp, filtro de liquidez (69→83 pruebas en total).
+- `8542875` — Actualiza este README (mismo contenido que `81f58d5`).
+- `ce7a4c0` — Corrige el cálculo del buffer del sleeve (`_affordable_qty`/`_sell_qty_for_proceeds`)
+  y endurece la conexión a IB Gateway (`timeout=20`, resync en `cancel_order()`) — 83→87 pruebas.
 
 Cada vez que se entregue código nuevo a esta carpeta, hace falta un `git add -A && git commit -m "..."`
 (yo puedo hacerlo localmente desde la nube) seguido de un `git push` **desde tu propia Terminal**
@@ -164,9 +190,11 @@ no contra la memoria de nadie.
 **Nota de riesgo:** el repositorio Git queda DENTRO de la carpeta sincronizada por OneDrive (a
 propósito, para no duplicar la carpeta) — y ya se vio, al crearlo, el mismo tipo de bloqueo de
 archivos ("Operation not permitted" en archivos temporales de Git, y una vez un `.git/HEAD.lock`
-trabado) que afecta a los demás archivos de esta carpeta. No ha impedido ningún commit hasta
-ahora, pero si `git status`/`git log` alguna vez se ven raros, es la primera sospecha — igual
-que con cualquier otro archivo de esta carpeta.
+trabado) que afecta a los demás archivos de esta carpeta. Volvió a aparecer un `.git/index.lock`
+trabado el 29-sep-2026 (mismo tipo de bloqueo, resuelto igual, con permiso explícito de Darwing
+para borrar en esa carpeta). No ha impedido ningún commit hasta ahora, pero si `git status`/
+`git log` alguna vez se ven raros, es la primera sospecha — igual que con cualquier otro archivo
+de esta carpeta.
 
 ## Requisito de Python (Mac de Darwing)
 
@@ -221,3 +249,4 @@ confirmó contra datos reales** en qué unidad la reporta IBKR para acciones/ETF
 `runner.py` actualizado debe confirmar esto comparando el ADV en dólares que calcula contra una
 referencia externa (p.ej. Yahoo Finance o el propio IB TWS) antes de confiar en un rechazo del
 filtro de liquidez — ver `evaluacion-avance-fase2.md` en el proyecto.
+</content>
