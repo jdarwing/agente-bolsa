@@ -11,11 +11,11 @@ Paquete Python del agente. Cada carpeta/archivo corresponde a una capa del plan
 | `agente/risk.py` | **Capa de riesgo**: valida cada orden propuesta, frenos (breakers), kill switch | ✅ Entregado · 38 pruebas |
 | `agente/audit.py` | Bitácora de auditoría (JSON Lines, solo-append) | ✅ Entregado |
 | `agente/strategy.py` | Señales (SMA200, EMA20/50, ATR, stops, cooldown de re-entrada) → propuestas de orden | ✅ Entregado · 23 pruebas |
-| `agente/broker.py` | Conexión a IB Gateway (paper 4002 / real bloqueado) + barras diarias (con volumen) vía IBKR | ✅ Entregado y probado contra IB Gateway real (18-sep-2026) · timeout de conexión (20s) y resync de `cancel_order()` endurecidos (29-sep-2026) |
+| `agente/broker.py` | Conexión a IB Gateway (paper 4002 / real bloqueado) + barras diarias (con volumen) vía IBKR | ✅ Entregado y probado contra IB Gateway real (18-sep-2026) · causa real del timeout de reconciliación corregida en `connect()` (`fetchFields` sin `ORDERS_OPEN`/`ORDERS_COMPLETE`) y resync de `cancel_order()` endurecido — **confirmado sin avisos de timeout en corrida real del 30-sep-2026** |
 | `agente/test_connection.py` | Prueba de humo: conecta, lee cuenta y barras de SPY | ✅ Corrida con éxito en la Mac de Darwing |
-| `agente/runner.py` | Ciclo diario: leer precios → señales → riesgo → órdenes → bitácora → arbitraje de cupos → sleeve conservador (BIL) → rebalanceo → estado persistido → stop-límite residente | ✅ Entregado y corrido contra IB Gateway real · 26 pruebas (cálculo del buffer del sleeve corregido, 29-sep-2026) |
+| `agente/runner.py` | Ciclo diario: leer precios → señales → riesgo → órdenes → bitácora → arbitraje de cupos → sleeve conservador (BIL) → rebalanceo → estado persistido → stop-límite residente | ✅ Entregado y corrido contra IB Gateway real · 26 pruebas — cálculo del buffer del sleeve corregido (29-sep-2026) y **confirmado exacto (Cash: 100.00) en las corridas del 29 y 30-sep-2026** |
 | Respaldo de datos (Nasdaq.com CSV) | Se decidió NO hacer un `data.py` separado: `broker.daily_bars()` ya cubre la fuente principal (IBKR); el respaldo manual reutiliza `load_nasdaq_csv()` de `backtest/engine.py`, que ya existe | ✅ simplificado |
-| Control de versiones | Git + GitHub (`github.com/jdarwing/agente-bolsa`, privado) — ver sección más abajo | ✅ Conectado (commit `ce7a4c0`) |
+| Control de versiones | Git + GitHub (`github.com/jdarwing/agente-bolsa`, privado) — ver sección más abajo | ✅ Conectado y al día (commit `3f1a116`) |
 
 ## Cómo correr las pruebas
 
@@ -83,21 +83,32 @@ arriesgar dinero de papel. Sus pruebas (`tests/test_runner.py`) usan un bróker 
    corrida real comparando el ADV calculado contra una referencia externa (Yahoo/IBKR TWS) antes
    de confiar en un rechazo de este filtro.
 
-**Octava brecha cerrada (29-sep-2026), al revisar las corridas del 24 y 28-sep:** el cash
-post-barrido quedaba consistentemente en ~US$62 en vez de la reserva de US$100
+**Octava brecha cerrada y confirmada (29/30-sep-2026), al revisar las corridas del 24 y 28-sep:**
+el cash post-barrido quedaba consistentemente en ~US$62 en vez de la reserva de US$100
 (`config.CASH_BUFFER`) — no era ruido, era un bug real. `_sweep_to_sleeve()`/`_defund_sleeve()`
 calculaban cuánto BIL comprar/vender asumiendo que la comisión de IBKR siempre era la mínima
 (US$0.35), cuando en realidad es `max(US$0.35, US$0.0035 × cantidad de acciones)` — en una
 compra de ~10,858 acciones eso son más de US$38 reales, no US$0.35, y ese exceso salía de la
 reserva. Se agregaron `_affordable_qty()` y `_sell_qty_for_proceeds()`, que resuelven la
-cantidad correcta considerando la comisión por acción. De paso se revisaron los avisos
-recurrentes de timeout ("open orders request timed out" / "completed orders request timed
-out"): el timeout de conexión por defecto de `ib_async` (~4s) probablemente no alcanzaba para
-que la sincronización inicial de órdenes terminara — se subió a 20s en `broker.connect()`, y
-`cancel_order()` ahora resincroniza órdenes abiertas antes de buscar la que va a cancelar. 4
-pruebas nuevas (83→87 en total). **Pendiente de verificar contra IB Gateway real:** que el cash
-post-barrido quede ahora cerca de los US$100, que el aviso de timeout no reaparezca, y que
-`cancel_order()` funcione la primera vez que haya que reemplazar un stop vigente de verdad.
+cantidad correcta considerando la comisión por acción. 4 pruebas nuevas (83→87 en total).
+**Confirmado contra IB Gateway real:** la corrida del 29-sep salió con `Cash: 100.00` exacto, y
+se repitió igual el 30-sep.
+
+De paso se revisaron los avisos recurrentes de timeout ("open orders request timed out" /
+"completed orders request timed out"). El primer intento (28-sep) subió el timeout de conexión
+de `ib_async` de ~4s a 20s, asumiendo que 4s no alcanzaba — **la corrida real del 29-sep demostró
+que ese diagnóstico era incorrecto**: el aviso siguió apareciendo igual con 20s. Al revisar el
+código fuente de `ib_async` (`ib.py`, `connectAsync()`) se encontró la causa real: al conectar,
+la librería pide en paralelo posiciones, órdenes abiertas y órdenes completadas, y estas dos
+últimas nunca reciben el mensaje de cierre de IB Gateway (posiblemente por el "Read-Only API"
+activo) — el problema no era cuánto tiempo se esperaba, sino que esas dos solicitudes no hacían
+falta ahí. La corrección real (commit `3f1a116`) saca `ORDERS_OPEN`/`ORDERS_COMPLETE` del
+`fetchFields` de `connect()`, ya que `runner.py` nunca depende de esa sincronización inicial
+(solo `cancel_order()` usa el estado de órdenes, y ya pide su propia resincronización fresca
+antes de buscar). **Confirmado contra IB Gateway real el 30-sep-2026:** la corrida de ese día no
+mostró ningún aviso de timeout. Ambas partes de esta brecha quedan cerradas de punta a punta.
+**Sigue pendiente de verificar:** que `cancel_order()` funcione la primera vez que haya que
+reemplazar un stop vigente de verdad.
 
 ## Automatizar la corrida diaria (LaunchAgent de macOS)
 
@@ -172,6 +183,10 @@ repositorio remoto privado en GitHub, `github.com/jdarwing/agente-bolsa` — con
 - `8542875` — Actualiza este README (mismo contenido que `81f58d5`).
 - `ce7a4c0` — Corrige el cálculo del buffer del sleeve (`_affordable_qty`/`_sell_qty_for_proceeds`)
   y endurece la conexión a IB Gateway (`timeout=20`, resync en `cancel_order()`) — 83→87 pruebas.
+- `cd0ce3a` — Actualiza README con la "octava brecha cerrada" (29-sep-2026).
+- `3f1a116` — Corrige la causa real del timeout de reconciliación en `broker.connect()`
+  (`fetchFields` sin `ORDERS_OPEN`/`ORDERS_COMPLETE`) — confirmado sin avisos de timeout en la
+  corrida real del 30-sep-2026.
 
 Cada vez que se entregue código nuevo a esta carpeta, hace falta un `git add -A && git commit -m "..."`
 (yo puedo hacerlo localmente desde la nube) seguido de un `git push` **desde tu propia Terminal**
